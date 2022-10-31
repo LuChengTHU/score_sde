@@ -1,3 +1,8 @@
+# Score-Based Generative Model with DPM-Solver
+
+We support the Jax version for DPM-Solver in this repo. The example command can be found in `sample.sh`. We used the `cifar10_ddpmpp_deep_continuous` pretrained checkpoint.
+
+
 # Score-Based Generative Modeling through Stochastic Differential Equations
 
 [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/score-based-generative-modeling-through-1/image-generation-on-cifar-10)](https://paperswithcode.com/sota/image-generation-on-cifar-10?p=score-based-generative-modeling-through-1)
