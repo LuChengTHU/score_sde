@@ -24,12 +24,13 @@ import jax.random as random
 import abc
 import flax
 
-from models.utils import from_flattened_numpy, to_flattened_numpy, get_score_fn
+from models.utils import from_flattened_numpy, to_flattened_numpy, get_score_fn, get_noise_fn
 from scipy import integrate
 import sde_lib
 from utils import batch_mul, batch_add
 
 from models import utils as mutils
+from dpm_solver import NoiseScheduleVP, model_wrapper, DPM_Solver
 
 _CORRECTORS = {}
 _PREDICTORS = {}
@@ -105,7 +106,9 @@ def get_sampling_fn(config, sde, model, shape, inverse_scaler, eps):
                                   shape=shape,
                                   inverse_scaler=inverse_scaler,
                                   denoise=config.sampling.noise_removal,
-                                  eps=eps)
+                                  eps=eps,
+                                  rtol=config.sampling.rk45_rtol,
+                                  atol=config.sampling.rk45_atol,)
   # Predictor-Corrector sampling. Predictor-only and Corrector-only samplers are special cases.
   elif sampler_name.lower() == 'pc':
     predictor = get_predictor(config.sampling.predictor.lower())
@@ -122,6 +125,20 @@ def get_sampling_fn(config, sde, model, shape, inverse_scaler, eps):
                                  continuous=config.training.continuous,
                                  denoise=config.sampling.noise_removal,
                                  eps=eps)
+  elif  sampler_name.lower() == 'dpm_solver':
+    sampling_fn = get_dpm_solver_sampler(sde=sde,
+                                  model=model,
+                                  shape=shape,
+                                  inverse_scaler=inverse_scaler,
+                                  steps=config.sampling.steps,
+                                  eps=eps,
+                                  skip_type=config.sampling.skip_type,
+                                  method=config.sampling.dpm_solver_method,
+                                  order=config.sampling.dpm_solver_order,
+                                  denoise=config.sampling.noise_removal,
+                                  predict_x0=config.sampling.predict_x0,
+                                  thresholding=config.sampling.thresholding,
+                                  rtol=config.sampling.rtol)
   else:
     raise ValueError(f"Sampler name {sampler_name} unknown.")
 
@@ -517,3 +534,59 @@ def get_ode_sampler(sde, model, shape, inverse_scaler,
     return x, nfe
 
   return ode_sampler
+
+
+def get_dpm_solver_sampler(sde, model, shape, inverse_scaler, steps=10, eps=1e-3,
+                    skip_type="logSNR", method="singlestep", order=3,
+                    denoise=False, predict_x0=False, thresholding=False,
+                    rtol=0.05, atol=0.0078):
+  """Create a Predictor-Corrector (PC) sampler.
+
+  Args:
+    sde: An `sde_lib.SDE` object representing the forward SDE.
+    shape: A sequence of integers. The expected shape of a single sample.
+    predictor: A subclass of `sampling.Predictor` representing the predictor algorithm.
+    corrector: A subclass of `sampling.Corrector` representing the corrector algorithm.
+    inverse_scaler: The inverse data normalizer.
+    snr: A `float` number. The signal-to-noise ratio for configuring correctors.
+    n_steps: An integer. The number of corrector steps per predictor update.
+    probability_flow: If `True`, solve the reverse-time probability flow ODE when running the predictor.
+    continuous: `True` indicates that the score model was continuously trained.
+    denoise: If `True`, add one-step denoising to the final samples.
+    eps: A `float` number. The reverse-time SDE and ODE are integrated to `epsilon` to avoid numerical issues.
+    device: PyTorch device.
+
+  Returns:
+    A sampling function that returns samples and the number of function evaluations during sampling.
+  """
+  ns = NoiseScheduleVP('linear', continuous_beta_0=sde.beta_0, continuous_beta_1=sde.beta_1)
+
+  def dpm_solver_sampler(rng, state):
+    """ The DPM-Solver sampler funciton.
+
+    Args:
+      rng: A JAX random state
+      state: A `flax.struct.dataclass` object that represents the training state of a score-based model.
+    Returns:
+      Samples, number of function evaluations
+    """
+    noise_pred_fn = get_noise_fn(sde, model, state.params_ema, state.model_state, train=False, continuous=True)
+    dpm_solver = DPM_Solver(noise_pred_fn, ns, predict_x0=predict_x0, thresholding=thresholding)
+    # Initial sample
+    rng, step_rng = random.split(rng)
+    x = sde.prior_sampling(step_rng, shape)
+    x = dpm_solver.sample(
+      x,
+      steps=steps - 1 if denoise else steps,
+      t_start=sde.T,
+      t_end=eps,
+      order=order,
+      skip_type=skip_type,
+      method=method,
+      denoise=denoise,
+      atol=atol,
+      rtol=rtol,
+    )
+    return inverse_scaler(x), steps
+
+  return jax.pmap(dpm_solver_sampler, axis_name='batch')

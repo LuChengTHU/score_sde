@@ -211,6 +211,7 @@ def train(config, workdir):
         with tf.io.gfile.GFile(
             os.path.join(this_sample_dir, "sample.png"), "wb") as fout:
           utils.save_image(image_grid, fout, nrow=nrow, padding=2)
+        logging.info("step: {}, saving samples in {}".format(step, this_sample_dir))
 
 
 def evaluate(config,
@@ -264,6 +265,9 @@ def evaluate(config,
     sampling_eps = 1e-5
   else:
     raise NotImplementedError(f"SDE {config.training.sde} unknown.")
+
+  if config.sampling.eps is not None:
+    sampling_eps = float(config.sampling.eps)
 
   # Create the one-step evaluation function when loss computation is enabled
   if config.eval.enable_loss:
@@ -427,21 +431,24 @@ def evaluate(config,
             step=ckpt * (num_sampling_rounds + num_bpd_rounds) + bpd_round_id,
             keep=1,
             prefix=f"meta_{jax.host_id()}_")
-    else:
-      # Skip likelihood computation and save intermediate states for pre-emption
-      eval_meta = eval_meta.replace(ckpt_id=ckpt, bpd_round_id=num_bpd_rounds - 1)
-      checkpoints.save_checkpoint(
-        eval_dir,
-        eval_meta,
-        step=ckpt * (num_sampling_rounds + num_bpd_rounds) + num_bpd_rounds - 1,
-        keep=1,
-        prefix=f"meta_{jax.host_id()}_")
+    # else:
+    #   # Skip likelihood computation and save intermediate states for pre-emption
+    #   eval_meta = eval_meta.replace(ckpt_id=ckpt, bpd_round_id=num_bpd_rounds - 1)
+      # checkpoints.save_checkpoint(
+      #   eval_dir,
+      #   eval_meta,
+      #   step=ckpt * (num_sampling_rounds + num_bpd_rounds) + num_bpd_rounds - 1,
+      #   keep=1,
+      #   prefix=f"meta_{jax.host_id()}_")
 
     # Generate samples and compute IS/FID/KID when enabled
     if config.eval.enable_sampling:
       state = jax.device_put(state)
       # Run sample generation for multiple rounds to create enough samples
       # Designed to be pre-emption safe. Automatically resumes when interrupted
+      if jax.host_id() == 0:
+        logging.info(f"Sampling in: {eval_dir}")
+
       for r in range(begin_sampling_round, num_sampling_rounds):
         if jax.host_id() == 0:
           logging.info("sampling -- ckpt: %d, round: %d" % (ckpt, r))
@@ -453,16 +460,21 @@ def evaluate(config,
 
         rng, *sample_rng = jax.random.split(rng, jax.local_device_count() + 1)
         sample_rng = jnp.asarray(sample_rng)
-        samples, n = sampling_fn(sample_rng, pstate)
-        samples = np.clip(samples * 255., 0, 255).astype(np.uint8)
-        samples = samples.reshape(
+        samples_raw, n = sampling_fn(sample_rng, pstate)
+        samples_raw = samples_raw.reshape(
           (-1, config.data.image_size, config.data.image_size, config.data.num_channels))
+        samples = np.clip(samples_raw * 255., 0, 255).astype(np.uint8)
         # Write samples to disk or Google Cloud Storage
         with tf.io.gfile.GFile(
             os.path.join(this_sample_dir, f"samples_{r}.npz"), "wb") as fout:
           io_buffer = io.BytesIO()
           np.savez_compressed(io_buffer, samples=samples)
           fout.write(io_buffer.getvalue())
+        if r == 0:
+          nrow = int(np.sqrt(samples.shape[0]))
+          with tf.io.gfile.GFile(
+              os.path.join(this_sample_dir, "sample.png"), "wb") as fout:
+            utils.save_image(samples_raw, fout, nrow=nrow, padding=2)
 
         # Force garbage collection before calling TensorFlow code for Inception network
         gc.collect()
@@ -482,14 +494,15 @@ def evaluate(config,
         eval_meta = eval_meta.replace(ckpt_id=ckpt, sampling_round_id=r, rng=rng)
         # Save an intermediate checkpoint directly if not the last round.
         # Otherwise save eval_meta after computing the Inception scores and FIDs
-        if r < num_sampling_rounds - 1:
-          checkpoints.save_checkpoint(
-            eval_dir,
-            eval_meta,
-            step=ckpt * (num_sampling_rounds + num_bpd_rounds) + r + num_bpd_rounds,
-            keep=1,
-            prefix=f"meta_{jax.host_id()}_")
+        # if r < num_sampling_rounds - 1:
+        #   checkpoints.save_checkpoint(
+        #     eval_dir,
+        #     eval_meta,
+        #     step=ckpt * (num_sampling_rounds + num_bpd_rounds) + r + num_bpd_rounds,
+        #     keep=1,
+        #     prefix=f"meta_{jax.host_id()}_")
 
+      # r = num_sampling_rounds
       # Compute inception scores, FIDs and KIDs.
       if jax.host_id() == 0:
         # Load all statistics that have been previously computed and saved for each host
@@ -555,12 +568,12 @@ def evaluate(config,
           time.sleep(1.)
 
       # Save eval_meta after computing IS/KID/FID to mark the end of evaluation for this checkpoint
-      checkpoints.save_checkpoint(
-        eval_dir,
-        eval_meta,
-        step=ckpt * (num_sampling_rounds + num_bpd_rounds) + r + num_bpd_rounds,
-        keep=1,
-        prefix=f"meta_{jax.host_id()}_")
+      # checkpoints.save_checkpoint(
+      #   eval_dir,
+      #   eval_meta,
+      #   step=ckpt * (num_sampling_rounds + num_bpd_rounds) + r + num_bpd_rounds,
+      #   keep=1,
+      #   prefix=f"meta_{jax.host_id()}_")
 
     else:
       # Skip sampling and save intermediate evaluation states for pre-emption

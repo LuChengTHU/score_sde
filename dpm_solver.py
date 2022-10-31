@@ -2,7 +2,6 @@ import jax
 import jax.numpy as jnp
 import jax.random as random
 import math
-import jax.experimental.host_callback as callback
 
 
 class NoiseScheduleVP:
@@ -936,21 +935,32 @@ class DPM_Solver:
             higher_update = lambda x, s, t, **kwargs: self.singlestep_dpm_solver_third_update(x, s, t, r1=r1, r2=r2, solver_type=solver_type, **kwargs)
         else:
             raise ValueError("For adaptive step size solver, order must be 2 or 3, got {}".format(order))
-        while jnp.abs((s - t_0)).mean() > t_err:
-            t = ns.inverse_lambda(lambda_s + h)
+
+        def update_fn(val):
+            x, x_prev, s, lambda_s, h, nfe = val
+            lambda_t = lambda_s + h
+            t = ns.inverse_lambda(lambda_t)
             x_lower, lower_noise_kwargs = lower_update(x, s, t)
             x_higher = higher_update(x, s, t, **lower_noise_kwargs)
-            delta = jnp.max(jnp.ones_like(x) * atol, rtol * jnp.max(jnp.abs(x_lower), jnp.abs(x_prev)))
-            norm_fn = lambda v: jnp.sqrt(jnp.square(v.reshape((v.shape[0], -1))).mean(dim=-1, keepdim=True))
-            E = norm_fn((x_higher - x_lower) / delta).max()
-            if jnp.all(E <= 1.):
-                x = x_higher
-                s = t
-                x_prev = x_lower
-                lambda_s = ns.marginal_lambda(s)
-            h = jnp.min(theta * h * jnp.float_power(E, -1. / order).float(), lambda_0 - lambda_s)
-            nfe += order
-        print('adaptive solver nfe', nfe)
+            delta = jnp.maximum(jnp.ones_like(x) * atol, rtol * jnp.maximum(jnp.abs(x_prev), jnp.abs(x_lower)))
+            norm_fn = lambda v: jnp.sqrt(jnp.mean(jnp.square(v.reshape((v.shape[0], -1))), axis=-1, keepdims=True))
+            E = jnp.max(norm_fn((x_higher - x_lower) / delta))
+            def next_step(inputs):
+                return x_higher, x_lower, t, lambda_t
+            def remain_step(inputs):
+                return x, x_prev, s, lambda_s
+            x, x_prev, s, lambda_s = jax.lax.cond(E <= 1., next_step, remain_step, ())
+            h = jnp.minimum(theta * h * jnp.power(E, -1. / order), lambda_0 - lambda_s)
+            nfe = nfe + order
+            return x, x_prev, s, lambda_s, h, nfe
+
+        def condition_continue(val):
+            x, x_prev, s, lambda_s, h, nfe = val
+            return (jnp.abs(s - t_0) > t_err).any()
+
+        x, _, _, _, _, nfe = jax.lax.while_loop(condition_continue, update_fn, (x, x_prev, s, lambda_s, h, 0))
+        import jax.experimental.host_callback as callback
+        callback.id_print(nfe)
         return x
 
     def sample(self, x, steps=20, t_start=None, t_end=None, order=3, skip_type='time_uniform',
@@ -1066,16 +1076,18 @@ class DPM_Solver:
                 model_prev_list.append(self.model_fn(x, vec_t))
                 t_prev_list.append(vec_t)
             # Compute the remaining values by `order`-th order multistep DPM-Solver.
-            for step in range(order, steps + 1):
+            ts_prev, models_prev = jnp.array(t_prev_list), jnp.array(model_prev_list)
+            def multistep_loop_fn(step, val):
+                x, ts_prev, models_prev = val
                 vec_t = timesteps[step].tile(x.shape[0])
-                x = self.multistep_dpm_solver_update(x, model_prev_list, t_prev_list, vec_t, order, solver_type=solver_type)
-                for i in range(order - 1):
-                    t_prev_list[i] = t_prev_list[i + 1]
-                    model_prev_list[i] = model_prev_list[i + 1]
-                t_prev_list[-1] = vec_t
+                x = self.multistep_dpm_solver_update(x, models_prev, ts_prev, vec_t, order, solver_type=solver_type)
+                ts_prev = jnp.roll(ts_prev, -1, axis=0)
+                models_prev = jnp.roll(models_prev, -1, axis=0)
+                ts_prev = ts_prev.at[-1].set(vec_t)
                 # We do not need to evaluate the final model value.
-                if step < steps:
-                    model_prev_list[-1] = self.model_fn(x, vec_t)
+                models_prev = models_prev.at[-1].set(jax.lax.cond(step < steps, lambda _: self.model_fn(x, vec_t), lambda _: models_prev[-1], (None,)))
+                return x, ts_prev, models_prev
+            x, _, _ = jax.lax.fori_loop(order, steps + 1, multistep_loop_fn, (x, ts_prev, models_prev))
         elif method in ['singlestep', 'singlestep_fixed']:
             if method == 'singlestep':
                 timesteps_outer, orders = self.get_orders_and_timesteps_for_singlestep_solver(steps=steps, order=order, skip_type=skip_type, t_T=t_T, t_0=t_0)

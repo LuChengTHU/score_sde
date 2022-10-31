@@ -25,15 +25,16 @@ def get_default_configs():
   sampling.noise_removal = True
   sampling.probability_flow = False
   sampling.snr = 0.16
+  sampling.eps = None
 
   # evaluation
   config.eval = evaluate = ml_collections.ConfigDict()
-  evaluate.begin_ckpt = 9
-  evaluate.end_ckpt = 26
-  evaluate.batch_size = 1024
-  evaluate.enable_sampling = False
+  evaluate.begin_ckpt = 8
+  evaluate.end_ckpt = 8
+  evaluate.batch_size = 2500
+  evaluate.enable_sampling = True
   evaluate.num_samples = 50000
-  evaluate.enable_loss = True
+  evaluate.enable_loss = False
   evaluate.enable_bpd = False
   evaluate.bpd_dataset = 'test'
 

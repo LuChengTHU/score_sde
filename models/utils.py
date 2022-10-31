@@ -161,6 +161,38 @@ def get_model_fn(model, params, states, train=False):
   return model_fn
 
 
+def get_noise_fn(sde, model, params, states, train=False, continuous=False, return_state=False):
+  """Wraps `noise_fn` so that the model output corresponds to a real time-dependent noise function.
+
+  Args:
+    sde: An `sde_lib.SDE` object that represents the forward SDE.
+    model: A score model.
+    train: `True` for training and `False` for evaluation.
+    continuous: If `True`, the score-based model is expected to directly take continuous time steps.
+
+  Returns:
+    A score function.
+  """
+  model_fn = get_model_fn(model, params, states, train=train)
+
+  if isinstance(sde, sde_lib.VPSDE) and continuous:
+    def noise_fn(x, t, rng=None):
+      # For VP-trained models, t=0 corresponds to the lowest noise level
+      # The maximum value of time embedding is assumed to 999 for
+      # continuously-trained models.
+      labels = t * 999
+      noise, state = model_fn(x, labels, rng)
+      if return_state:
+        return noise, state
+      else:
+        return noise
+
+  else:
+    raise NotImplementedError(f"SDE class {sde.__class__.__name__} not yet supported.")
+
+  return noise_fn
+
+
 def get_score_fn(sde, model, params, states, train=False, continuous=False, return_state=False):
   """Wraps `score_fn` so that the model output corresponds to a real time-dependent score function.
 
